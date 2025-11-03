@@ -1,0 +1,31 @@
+{
+	"python.autoComplete.extraPaths":	["C:/Users/cnd/AppData/Roaming/Autodesk/Autodesk Fusion 360/API/Python/defs"],
+	"python.analysis.extraPaths":	["C:/Users/cnd/AppData/Roaming/Autodesk/Autodesk Fusion 360/API/Python/defs"],
+	"python.defaultInterpreterPath": "C:/Users/cnd/AppData/Local/Autodesk/webdeploy/production/b4ebb90d69b5fc8cf013f75341ee2a1192c9da8e/Python/python.exe",
+
+
+    "specstory.helpUsImprove": false,
+    "specstory.showDeveloperTools": false,
+    "specstory.autoSave.enabled": true,
+
+  "workbench.colorCustomizations": {
+    //"editor.background": "#001a33",      // Very dark blue for the text editor
+    //"sideBar.background": "#001122",     // Slightly different dark blue for sidebar
+    //"activityBar.background": "#000d1a"  // Darkest blue for the leftmost bar
+
+    "titleBar.activeBackground": "#0A65C0", // Updated from #CC5500 to align with the requested blue active chrome
+    "titleBar.activeForeground": "#ffffff",
+    "titleBar.inactiveBackground": "#084A93", // Updated from #A04000 to a darker blue to reduce cross-window confusion
+    "titleBar.inactiveForeground": "#cccccc",
+
+    "statusBar.background": "#0A65C0", // Updated from #CC5500 to match the requested blue accent
+    "statusBar.foreground": "#ffffff",
+
+    "activityBar.background": "#084A93", // Updated from #A04000 to the same darker blue for inactive chrome elements
+    "activityBar.foreground": "#ffffff"
+   },
+
+  "specstory.coordinatedUniversalTimezone": false,
+  "specstory.cloudSync.enabled": "never"
+}
+

@@ -36,11 +36,22 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 
 ## Features
 
+- **Dual-mode communication**: Automatic detection and use of Aura Friday MCP-Link Server (Reverse MCP) with fallback to legacy STDIO
 - **Two-way communication**: Connect Claude AI to Blender through a socket-based server
 - **Object manipulation**: Create, modify, and delete 3D objects in Blender
 - **Material control**: Apply and modify materials and colors
 - **Scene inspection**: Get detailed information about the current Blender scene
 - **Code execution**: Run arbitrary Python code in Blender from Claude
+
+### 🆕 Reverse MCP Mode (Optional Enhancement)
+
+This fork includes support for the **Aura Friday MCP-Link Server**, which provides:
+- Enhanced tool registration and discovery
+- Better error handling and retry logic
+- Support for multiple AI clients simultaneously
+- Future-proof architecture for advanced MCP features
+
+The system automatically detects and uses the MCP-Link Server if available, otherwise falls back to the standard STDIO mode. See [REVERSE_MCP_INTEGRATION.md](REVERSE_MCP_INTEGRATION.md) for details.
 
 ## Components
 
