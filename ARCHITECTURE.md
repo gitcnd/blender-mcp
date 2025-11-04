@@ -1,358 +1,249 @@
-# Architecture: Reverse MCP Integration
+# Architecture: Reverse MCP Integration (Correct Implementation)
 
 ## High-Level Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         AI Client                                │
-│                   (Claude / Cursor / etc)                        │
-└────────────────────┬────────────────────────────────────────────┘
-                     │
-                     │ (Chooses path automatically)
-                     │
-         ┌───────────┴───────────┐
-         │                       │
-    [Reverse MCP]           [Legacy STDIO]
-         │                       │
-         ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐
-│  MCP-Link       │     │  BlenderMCP     │
-│  Server         │     │  Server         │
-│  (Aura Friday)  │     │  (direct)       │
-└────────┬────────┘     └────────┬────────┘
-         │                       │
-         │ SSE + POST           │ STDIO
-         ▼                       │
-┌─────────────────┐             │
-│  BlenderMCP     │◄────────────┘
-│  Server         │
-│  (reverse_      │
-│   bridge)       │
-└────────┬────────┘
-         │
-         │ TCP Socket (both paths converge here)
-         ▼
-┌─────────────────┐
-│  Blender Addon  │
-│  (addon.py)     │
-│  Port 9876      │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│    Blender      │
-│    (bpy)        │
-└─────────────────┘
-```
-
-## Detailed: Reverse MCP Mode
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│                      AI Client (Claude)                        │
-└──────────────┬────────────────────────────────────────────────┘
-               │
-               │ MCP protocol
-               ▼
-┌──────────────────────────────────────────────────────────────┐
-│              Aura Friday MCP-Link Server                      │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ • Tool Registry (with blender_* tools)               │   │
-│  │ • SSE Broadcaster (sends tool calls)                 │   │
-│  │ • POST Receiver (receives tool replies)             │   │
-│  │ • Authentication & Authorization                     │   │
-│  └──────────────────────────────────────────────────────┘   │
-└────────────┬─────────────────────────────────┬───────────────┘
-             │                                 │
-             │ SSE (Server-Sent Events)       │ POST replies
-             │ Tool calls →                    │ ← Results
-             ▼                                 │
-┌────────────────────────────────────────────────────────────────┐
-│         BlenderMCP Server (reverse_bridge.py)                  │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  Initialization:                                       │   │
-│  │  1. Find native messaging manifest                    │   │
-│  │  2. Discover MCP-Link server endpoint                 │   │
-│  │  3. Connect to SSE endpoint                           │   │
-│  │  4. Register all Blender tools                        │   │
-│  │  5. Start listener thread                             │   │
-│  └────────────────────────────────────────────────────────┘   │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  Reverse Call Handler (listener thread):              │   │
-│  │  • Listen on reverse_queue (from SSE)                 │   │
-│  │  • Extract: tool_name, call_id, input_data            │   │
-│  │  • Map tool_name → Blender command                    │   │
-│  │  • Forward to Blender addon via TCP socket            │   │
-│  │  • Format result for MCP                              │   │
-│  │  • POST reply back to MCP-Link server                 │   │
-│  └────────────────────────────────────────────────────────┘   │
-└────────────┬───────────────────────────────────────────────────┘
-             │
-             │ TCP Socket (localhost:9876)
-             │ JSON commands ↓ / responses ↑
-             ▼
-┌────────────────────────────────────────────────────────────────┐
-│              Blender Addon Socket Server                       │
-│  • Accepts connections on port 9876                            │
-│  • Receives JSON commands                                      │
-│  • Schedules execution in main thread (bpy.app.timers)        │
-│  • Returns JSON responses                                      │
-└────────────┬───────────────────────────────────────────────────┘
+                    ┌─────────────────┐
+                    │   AI Client     │
+                    │ (Claude/Cursor) │
+                    └────────┬────────┘
+                             │
+             ┌───────────────┴───────────────┐
+             │                               │
+        [Reverse MCP]                  [Legacy STDIO]
+             │                               │
+             ▼                               ▼
+    ┌─────────────────┐            ┌─────────────────┐
+    │  MCP-Link       │            │  server.py      │
+    │  Server         │            │  (FastMCP)      │
+    │  (Aura Friday)  │            └────────┬────────┘
+    └────────┬────────┘                     │
+             │                              │ TCP Socket
+             │ SSE + POST                   │ Port 9876
+             ▼                              │
+    ┌─────────────────┐                    │
+    │  addon.py       │◄───────────────────┘
+    │  (Blender)      │
+    │  • Reverse MCP  │
+    │  • Legacy socket│
+    └────────┬────────┘
              │
              ▼
-┌────────────────────────────────────────────────────────────────┐
-│                      Blender (bpy)                             │
-│  • Executes commands in Blender context                        │
-│  • Returns results                                             │
-└────────────────────────────────────────────────────────────────┘
+    ┌─────────────────┐
+    │    Blender      │
+    │    (bpy)        │
+    └─────────────────┘
 ```
 
-## Detailed: Legacy STDIO Mode
+##
+
+ Key Difference from Previous Implementation
+
+### ✅ CORRECT (Current Implementation):
+
+**Reverse MCP Mode:**
+```
+AI → MCP-Link Server → addon.py (direct integration) → Blender
+```
+- **addon.py** discovers and connects to MCP-Link Server
+- **addon.py** registers tools and handles reverse calls
+- **server.py is NOT running** - not needed!
+- **No port 9876 socket** created
+
+**Legacy Mode (Fallback):**
+```
+AI → server.py (STDIO) → TCP Socket 9876 → addon.py → Blender
+```
+- User runs `uvx blender-mcp` which starts **server.py**
+- **addon.py** creates TCP socket on port 9876
+- Works exactly as original BlenderMCP
+
+### ❌ WRONG (Previous Attempt):
 
 ```
-┌───────────────────────────────────────────────────────────────┐
-│                      AI Client (Claude)                        │
-└──────────────┬────────────────────────────────────────────────┘
-               │
-               │ MCP protocol (STDIO)
-               │ stdin/stdout
-               ▼
-┌────────────────────────────────────────────────────────────────┐
-│         BlenderMCP Server (server.py)                          │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  FastMCP Server:                                       │   │
-│  │  • Receives tool calls via stdin                       │   │
-│  │  • Processes with @mcp.tool() decorated functions      │   │
-│  │  • Sends results via stdout                            │   │
-│  └────────────────────────────────────────────────────────┘   │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │  BlenderConnection (direct socket):                    │   │
-│  │  • Connects to Blender addon socket                    │   │
-│  │  • send_command(type, params)                          │   │
-│  │  • Waits for response                                  │   │
-│  └────────────────────────────────────────────────────────┘   │
-└────────────┬───────────────────────────────────────────────────┘
-             │
-             │ TCP Socket (localhost:9876)
-             │ JSON commands ↓ / responses ↑
-             ▼
-┌────────────────────────────────────────────────────────────────┐
-│              Blender Addon Socket Server                       │
-│  (same as Reverse MCP mode)                                    │
-└────────────┬───────────────────────────────────────────────────┘
-             │
-             ▼
-┌────────────────────────────────────────────────────────────────┐
-│                      Blender (bpy)                             │
-└────────────────────────────────────────────────────────────────┘
+AI → MCP-Link Server → reverse_bridge.py → TCP Socket 9876 → addon.py → Blender
 ```
+- Had unnecessary middleware layer
+- Still used port 9876 even in Reverse MCP mode
+- More complex, less efficient
 
-## Tool Registration Flow (Reverse MCP)
+## Detailed Flow: Reverse MCP Mode
 
 ```
-BlenderMCP Server Startup
-         │
-         ▼
-   Try to connect
-   to MCP-Link?
-         │
-         ├─YES──────────────────────────────────┐
-         │                                       ▼
-         │                         Find native messaging manifest
-         │                                       │
-         │                                       ▼
-         │                         Run native binary to get config
-         │                                       │
-         │                                       ▼
-         │                         Extract server URL & auth token
-         │                                       │
-         │                                       ▼
-         │                         Connect to SSE endpoint
-         │                                       │
-         │                                       ▼
-         │                         Register tools with MCP-Link:
-         │                         ┌────────────────────────────┐
-         │                         │ blender_get_scene_info     │
-         │                         │ blender_get_object_info    │
-         │                         │ blender_get_viewport_...   │
-         │                         │ blender_execute_code       │
-         │                         └────────────────────────────┘
-         │                                       │
-         │                                       ▼
-         │                         Start reverse call listener
-         │                                       │
-         │                                       └─────┐
-         │                                             │
-         ├─NO (or failed)──────┐                     │
-         │                     │                     │
-         ▼                     ▼                     ▼
-   Use Legacy Mode    Connect direct socket   Use Reverse MCP Mode
-         │                     │                     │
-         └─────────────────────┴─────────────────────┘
-                               │
-                               ▼
-                    Connect to Blender addon
-                               │
-                               ▼
-                         Server Ready
+1. User clicks "Connect to MCP server" in Blender
+   │
+   ▼
+2. addon.py: BlenderMCPServer.start()
+   │
+   ▼
+3. addon.py: _try_start_reverse_mcp()
+   ├─ Find native messaging manifest
+   ├─ Run native binary to get config
+   ├─ Extract server URL & auth token
+   ├─ Connect to SSE endpoint
+   ├─ Start SSE reader thread
+   ├─ Check for 'remote' tool
+   ├─ Register Blender tools:
+   │  • blender_get_scene_info
+   │  • blender_get_object_info
+   │  • blender_execute_code
+   └─ Start reverse call listener thread
+   │
+   ▼
+4. Blender addon now directly integrated with MCP-Link!
+   │
+   ▼
+5. When AI calls a tool:
+   AI → MCP-Link Server
+        │
+        ▼ SSE (reverse call)
+   addon.py: _reverse_call_listener()
+        │
+        ▼
+   addon.py: _handle_reverse_tool_call()
+        │
+        ▼
+   Execute in Blender (bpy)
+        │
+        ▼ Result
+   addon.py: send_tool_reply()
+        │
+        ▼ POST
+   MCP-Link Server → AI
 ```
 
-## Message Flow: Tool Call (Reverse MCP)
+## Detailed Flow: Legacy Mode (Fallback)
 
 ```
-1. AI calls tool
+1. User clicks "Connect to MCP server" in Blender
    │
    ▼
-2. MCP-Link Server receives call
+2. addon.py: BlenderMCPServer.start()
    │
    ▼
-3. MCP-Link forwards via SSE
-   │ Event: {reverse: {tool: "blender_get_scene_info", call_id: "...", input: {...}}}
+3. addon.py: _try_start_reverse_mcp()
+   └─ Returns False (MCP-Link not found)
    │
    ▼
-4. reverse_bridge receives on SSE stream
-   │ • Queued in reverse_queue
-   │ • Listener thread picks it up
+4. addon.py: Creates TCP socket on port 9876
+   addon.py: Waits for connection
    │
    ▼
-5. reverse_bridge._handle_tool_call()
-   │ • Maps tool name to Blender command
-   │ • Calls self.send_command()
+5. User has configured Claude/Cursor with:
+   "command": "uvx", "args": ["blender-mcp"]
    │
    ▼
-6. Send to Blender addon via TCP socket
-   │ JSON: {type: "get_scene_info", params: {}}
+6. server.py starts (FastMCP via STDIO)
    │
    ▼
-7. Blender addon processes
-   │ • Schedules in main thread
-   │ • Executes command
-   │ • Returns result
+7. server.py: Connects to addon.py via TCP socket
    │
    ▼
-8. reverse_bridge receives result
-   │ • Formats as MCP response
-   │ • {content: [{type: "text", text: "..."}], isError: false}
-   │
-   ▼
-9. POST reply to MCP-Link Server
-   │ Method: tools/reply
-   │ Params: {call_id: "...", result: {...}}
-   │
-   ▼
-10. MCP-Link forwards to AI
-    │
-    ▼
-11. AI receives result
+8. When AI calls a tool:
+   AI → server.py (STDIO)
+        │
+        ▼
+   server.py: Tool handler function
+        │
+        ▼ TCP Socket
+   addon.py: Receives JSON command
+        │
+        ▼
+   Execute in Blender (bpy)
+        │
+        ▼ TCP Socket
+   server.py: Receives result
+        │
+        ▼ STDIO
+   AI receives result
 ```
 
-## Connection State Machine
-
-```
-                    ┌─────────┐
-                    │  Start  │
-                    └────┬────┘
-                         │
-                         ▼
-            ┌────────────────────────┐
-            │ Check REVERSE_MCP_     │
-            │    AVAILABLE flag      │
-            └────┬──────────────┬────┘
-                 │              │
-           Yes   │              │ No
-                 ▼              ▼
-      ┌──────────────────┐  ┌──────────────────┐
-      │ Try Reverse MCP  │  │ Use Legacy Mode  │
-      └────┬─────────────┘  └─────────┬────────┘
-           │                          │
-           ▼                          │
-      ┌──────────────────┐           │
-      │ MCP-Link found? │           │
-      └────┬─────────────┘           │
-           │                          │
-     Yes   │ No                       │
-           │  │                       │
-           ▼  ▼                       │
-      ┌────┐ ┌─────────────┐         │
-      │ ✓  │ │ Fallback to │         │
-      │    │ │ Legacy Mode │         │
-      └─┬──┘ └──────┬──────┘         │
-        │           │                │
-        │           └────────┬───────┘
-        │                    │
-        └────────┬───────────┘
-                 │
-                 ▼
-        ┌─────────────────┐
-        │ Connect to      │
-        │ Blender Addon   │
-        └────┬────────────┘
-             │
-             ▼
-        ┌─────────────────┐
-        │  Server Ready   │
-        └─────────────────┘
-```
-
-## File Organization
+## File Structure
 
 ```
 blender-mcp/
-├── src/
-│   └── blender_mcp/
-│       ├── __init__.py              # Module exports
-│       ├── server.py                # Main MCP server + legacy connection
-│       ├── reverse_mcp_client.py    # MCP-Link client library
-│       └── reverse_bridge.py        # ReverseBlenderConnection
+├── addon.py                     # ✅ MODIFIED - Now includes Reverse MCP
+│   ├── Reverse MCP client functions
+│   ├── BlenderMCPServer class (dual-mode)
+│   └── All Blender tool implementations
 │
-├── addon.py                         # Blender addon (unchanged)
-├── main.py                          # Entry point (unchanged)
+├── src/blender_mcp/
+│   ├── server.py                # ✅ UNCHANGED - Only used in legacy mode
+│   └── __init__.py              # ✅ UNCHANGED
 │
-├── README.md                        # Main readme (updated)
-├── REVERSE_MCP_INTEGRATION.md       # Full integration docs
-├── ARCHITECTURE.md                  # This file
-├── INTEGRATION_SUMMARY.md           # Technical summary
-├── QUICK_START_REVERSE_MCP.md       # Quick start guide
+├── main.py                      # ✅ UNCHANGED
+├── pyproject.toml               # ✅ UNCHANGED
 │
-└── test_reverse_integration.py      # Integration tests
+└── Documentation/
+    ├── README.md
+    ├── ARCHITECTURE.md (this file)
+    ├── REVERSE_MCP_INTEGRATION.md
+    └── QUICK_START_REVERSE_MCP.md
 ```
 
-## Key Components
+## Code Organization in addon.py
 
-### 1. reverse_mcp_client.py
-**Purpose:** Low-level client for MCP-Link Server  
-**Key Functions:**
-- `find_native_messaging_manifest()`
-- `discover_mcp_server_endpoint()`
-- `connect_to_sse_endpoint()`
-- `send_jsonrpc_request()`
-- `send_tool_reply()`
-
-### 2. reverse_bridge.py
-**Purpose:** Bridge between MCP-Link and Blender  
-**Key Class:** `ReverseBlenderConnection`  
-**Key Methods:**
-- `connect()` - Sets up everything
-- `disconnect()` - Cleans up
-- `send_command()` - Same interface as legacy
-- `_register_all_tools()` - Registers with MCP-Link
-- `_listen_for_reverse_calls()` - Handles incoming calls
-- `_handle_tool_call()` - Forwards to Blender
-
-### 3. server.py
-**Purpose:** Main MCP server with dual-mode support  
-**Key Function:** `get_blender_connection()`  
-**Logic:**
 ```python
-if REVERSE_MCP_AVAILABLE:
-    try:
-        reverse_conn = ReverseBlenderConnection(...)
-        if reverse_conn.connect():
-            return reverse_conn  # Use Reverse MCP
-    except:
-        pass  # Fall through
-# Use legacy
-return BlenderConnection(...)
+# ============================================================================
+# Section 1: Imports (added http.client, ssl, uuid, queue, etc.)
+# ============================================================================
+
+# ============================================================================
+# Section 2: Reverse MCP Client Functions
+# ============================================================================
+def find_native_messaging_manifest()
+def discover_mcp_server_endpoint()
+def connect_to_sse_endpoint()
+def send_jsonrpc_request()
+def send_tool_reply()
+
+# ============================================================================
+# Section 3: BlenderMCPServer Class (Enhanced)
+# ============================================================================
+class BlenderMCPServer:
+    def __init__():
+        # Added: Reverse MCP attributes
+        
+    def start():
+        # NEW: Try Reverse MCP first
+        # FALLBACK: Legacy socket server
+        
+    def _try_start_reverse_mcp():           # NEW
+    def _start_sse_reader():                # NEW
+    def _register_blender_tools():          # NEW
+    def _reverse_call_listener():           # NEW
+    def _handle_reverse_tool_call():        # NEW
+    def _cleanup_reverse_mcp():             # NEW
+    
+    def stop():
+        # Enhanced: Clean up both modes
+        
+    def _server_loop():                     # UNCHANGED (legacy)
+    def _handle_client():                   # UNCHANGED (legacy)
+    def execute_command():                  # UNCHANGED (used by both)
+    def get_scene_info():                   # UNCHANGED (used by both)
+    def get_object_info():                  # UNCHANGED (used by both)
+    def execute_code():                     # UNCHANGED (used by both)
+    # ... all other tool methods unchanged
+```
+
+## Mode Detection Logic
+
+```python
+def start(self):
+    if self._try_start_reverse_mcp():
+        self.mode = "reverse_mcp"
+        # ✓ Connected to MCP-Link Server
+        # ✓ Tools registered
+        # ✓ Listening for reverse calls
+        # ✗ No TCP socket created
+        # ✗ server.py not needed
+        return
+    
+    # Fallback to legacy
+    self.mode = "legacy"
+    # ✓ TCP socket on port 9876
+    # ✓ Waiting for server.py connection
 ```
 
 ## Threading Model
@@ -360,38 +251,88 @@ return BlenderConnection(...)
 ### Reverse MCP Mode
 
 ```
-Main Thread
-├─ FastMCP server
-└─ Tool handlers
-    └─ Call get_blender_connection()
-        └─ Returns ReverseBlenderConnection
-            └─ Has background threads:
+Main Blender Thread
+└─ UI / Scene operations
 
 Background Thread 1: SSE Reader
 ├─ Reads SSE stream continuously
 ├─ Routes reverse calls to reverse_queue
-└─ Routes responses to pending_responses[id]
+└─ Routes responses to pending_responses
 
 Background Thread 2: Reverse Call Listener
 ├─ Blocks on reverse_queue.get()
 ├─ Processes tool calls
-├─ Forwards to Blender addon
-└─ Sends replies back
+├─ Executes in Blender via bpy.app.timers
+└─ Sends POST replies
 ```
 
 ### Legacy Mode
 
 ```
-Main Thread
-├─ FastMCP server
-└─ Tool handlers
-    └─ Call get_blender_connection()
-        └─ Returns BlenderConnection
-            └─ Direct synchronous socket calls
-                (No background threads)
+Main Blender Thread
+└─ UI / Scene operations
+
+Background Thread 1: Server Loop
+├─ Accepts TCP connections
+└─ Spawns client handler threads
+
+Background Thread N: Client Handler
+├─ Receives JSON commands
+├─ Schedules execution via bpy.app.timers
+└─ Sends JSON responses
 ```
 
-## Security Considerations
+## Benefits of This Architecture
+
+### Reverse MCP Mode
+1. **✅ True Direct Integration** - No middleware, no extra process
+2. **✅ Eliminates Port 9876** - No TCP socket needed
+3. **✅ One Less Process** - server.py not running
+4. **✅ More Efficient** - Fewer hops in communication
+5. **✅ Self-Sufficient** - addon.py handles everything
+
+### Legacy Mode
+6. **✅ Perfect Backward Compatibility** - Works exactly as before
+7. **✅ No Breaking Changes** - Existing users unaffected
+8. **✅ Automatic Fallback** - Seamless when MCP-Link unavailable
+
+## Comparison Table
+
+| Aspect | Reverse MCP | Legacy |
+|--------|-------------|--------|
+| Processes | 1 (Blender only) | 2 (Blender + server.py) |
+| Port 9876 | ❌ Not used | ✅ Required |
+| server.py | ❌ Not running | ✅ Running |
+| Communication | SSE + POST | STDIO + TCP |
+| Setup | Auto-detect | Manual config |
+| Efficiency | High (direct) | Medium (2 hops) |
+| Multi-client | ✅ Yes | ❌ No |
+
+## Tool Registration
+
+### Reverse MCP Mode
+
+Tools are registered directly with MCP-Link Server:
+
+```python
+{
+    "tool_name": "blender_get_scene_info",
+    "readme": "Get detailed information...",
+    "description": "Retrieves comprehensive...",
+    "parameters": {...},
+    "callback_endpoint": "blender-mcp://blender_get_scene_info",
+    "TOOL_API_KEY": "blender_mcp_auth_key_v1"
+}
+```
+
+Tools become available to ANY AI connected to MCP-Link Server.
+
+### Legacy Mode
+
+Tools are discovered via FastMCP's `@mcp.tool()` decorators in server.py.
+Standard MCP protocol via STDIO.
+
+## Security
 
 ### Reverse MCP Mode
 - ✅ Authentication via MCP-Link Server tokens
@@ -400,43 +341,45 @@ Main Thread
 - ✅ Callback endpoint validation
 
 ### Legacy Mode
-- ⚠️ No authentication on Blender socket
-- ⚠️ Localhost-only by default
-- ⚠️ Should not be exposed to network
-
-## Performance Characteristics
-
-| Aspect | Legacy Mode | Reverse MCP Mode |
-|--------|-------------|------------------|
-| Latency | Low (direct socket) | Medium (SSE + socket) |
-| Throughput | High | Medium |
-| Reliability | Medium (STDIO buffering) | High (SSE retry logic) |
-| Multi-client | No | Yes |
-| Scalability | Single client | Multiple clients |
-
-## Error Handling
-
-Both modes implement robust error handling:
-
-1. **Connection Loss**
-   - Reverse MCP: Automatic SSE reconnection
-   - Legacy: Socket recreated on next call
-
-2. **Tool Call Failures**
-   - Both: Return error in response
-   - Reverse MCP: Can retry at MCP-Link level
-
-3. **Blender Crashes**
-   - Both: Detect via socket closure
-   - Both: Report error to AI
+- ⚠️ No authentication on port 9876 socket
+- ⚠️ Localhost-only binding
+- ⚠️ Should not expose to network
 
 ## Future Enhancements
 
-Potential improvements for Reverse MCP:
+Possible improvements:
 
-1. **WebSocket Alternative**: Replace SSE with WebSocket for bidirectional
-2. **Tool Hot-Reload**: Register new tools without restart
-3. **Multi-Blender**: Support multiple Blender instances
-4. **Authentication**: Per-user or per-session tokens
-5. **Metrics**: Track tool usage and performance
+1. **More Tools**: Add all Blender tools (PolyHaven, Hyper3D, Sketchfab)
+2. **Screenshot Support**: Handle images in reverse calls
+3. **WebSocket**: Alternative to SSE
+4. **Multi-Blender**: Support multiple instances
+5. **Hot Reload**: Register new tools without restart
 
+## Migration Path
+
+For existing users:
+
+1. **No changes required** - addon.py will use legacy mode if MCP-Link not installed
+2. **Optional upgrade** - Install MCP-Link Server to get Reverse MCP
+3. **Automatic detection** - System chooses best mode on startup
+
+## Summary
+
+The key insight of this architecture is:
+
+> **The addon itself should be smart enough to choose its communication method**
+
+Rather than:
+- Building middleware to bridge MCP-Link → Blender
+- Keeping port 9876 socket even when using MCP-Link
+
+We instead:
+- Made addon.py discover and use MCP-Link directly
+- Eliminated the middleware entirely
+- Kept legacy socket as clean fallback
+
+This results in:
+- **Simpler** - Fewer moving parts
+- **Faster** - Direct integration
+- **Cleaner** - No unnecessary layers
+- **Compatible** - Works both ways

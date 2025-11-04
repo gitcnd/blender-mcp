@@ -1,4 +1,5 @@
 # Code created by Siddharth Ahuja: www.github.com/ahujasid © 2025
+# Enhanced with Reverse MCP support
 
 import bpy
 import mathutils
@@ -12,9 +13,17 @@ import traceback
 import os
 import shutil
 import zipfile
+import platform
+import subprocess
+import ssl
+import uuid
+import queue
+from pathlib import Path
 from bpy.props import StringProperty, IntProperty, BoolProperty, EnumProperty
 import io
 from contextlib import redirect_stdout, suppress
+from urllib.parse import urlparse
+import http.client
 
 bl_info = {
     "name": "Blender MCP",
@@ -32,6 +41,280 @@ RODIN_FREE_TRIAL_KEY = "k9TcfFoEhNd9cCPP2guHAHHHkctZHIRhZDywZ1euGUXwihbYLpOjQhof
 REQ_HEADERS = requests.utils.default_headers()
 REQ_HEADERS.update({"User-Agent": "blender-mcp"})
 
+
+# ============================================================================
+# Reverse MCP Client Functions (Aura Friday MCP-Link Server Integration)
+# ============================================================================
+
+def find_native_messaging_manifest():
+    """Find the native messaging manifest for com.aurafriday.shim."""
+    system_name = platform.system().lower()
+    possible_paths = []
+    
+    if system_name == "windows":
+        appdata_local = os.environ.get('LOCALAPPDATA')
+        if appdata_local:
+            possible_paths.append(Path(appdata_local) / "AuraFriday" / "com.aurafriday.shim.json")
+        possible_paths.append(Path.home() / "AppData" / "Local" / "AuraFriday" / "com.aurafriday.shim.json")
+    elif system_name == "darwin":  # macOS
+        possible_paths.extend([
+            Path.home() / "Library" / "Application Support" / "Google" / "Chrome" / "NativeMessagingHosts" / "com.aurafriday.shim.json",
+            Path.home() / "Library" / "Application Support" / "Chromium" / "NativeMessagingHosts" / "com.aurafriday.shim.json",
+        ])
+    else:  # Linux
+        possible_paths.extend([
+            Path.home() / ".config" / "google-chrome" / "NativeMessagingHosts" / "com.aurafriday.shim.json",
+            Path.home() / ".config" / "chromium" / "NativeMessagingHosts" / "com.aurafriday.shim.json",
+        ])
+    
+    for path in possible_paths:
+        if path.exists():
+            return path
+    return None
+
+
+def discover_mcp_server_endpoint(manifest_path):
+    """Discover the MCP server endpoint by running the native messaging binary."""
+    try:
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+    except Exception as e:
+        print(f"Error reading manifest: {e}")
+        return None
+    
+    binary_path = manifest.get('path')
+    if not binary_path or not Path(binary_path).exists():
+        return None
+    
+    try:
+        creation_flags = 0
+        if platform.system() == 'Windows':
+            try:
+                creation_flags = subprocess.CREATE_NO_WINDOW
+            except AttributeError:
+                pass
+        
+        proc = subprocess.Popen(
+            [str(binary_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            text=False,
+            bufsize=0,
+            creationflags=creation_flags
+        )
+        
+        json_data = None
+        start_time = time.time()
+        timeout = 5.0
+        accumulated = b""
+        
+        while time.time() - start_time < timeout:
+            try:
+                chunk = proc.stdout.read(1)
+                if chunk:
+                    accumulated += chunk
+                    try:
+                        text = accumulated.decode('utf-8', errors='ignore')
+                        json_start = text.find('{')
+                        if json_start != -1:
+                            try:
+                                json_data = json.loads(text[json_start:])
+                                break
+                            except json.JSONDecodeError:
+                                pass
+                    except:
+                        pass
+                else:
+                    time.sleep(0.01)
+            except:
+                time.sleep(0.01)
+        
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except:
+            try:
+                proc.kill()
+            except:
+                pass
+        
+        return json_data
+    except Exception as e:
+        print(f"Error discovering endpoint: {e}")
+        return None
+
+
+def connect_to_sse_endpoint(server_url, auth_header):
+    """Connect to the SSE endpoint and return connection info."""
+    try:
+        parsed_url = urlparse(server_url)
+        host = parsed_url.netloc
+        path = parsed_url.path
+        use_https = parsed_url.scheme == 'https'
+        
+        if use_https:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            conn = http.client.HTTPSConnection(host, context=context, timeout=30)
+        else:
+            conn = http.client.HTTPConnection(host, timeout=30)
+        
+        headers = {
+            'Accept': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Authorization': auth_header,
+        }
+        
+        conn.request('GET', path, headers=headers)
+        response = conn.getresponse()
+        
+        if response.status != 200:
+            conn.close()
+            return None
+        
+        session_id = None
+        message_endpoint = None
+        event_type = None
+        
+        for _ in range(10):
+            line = response.readline().decode('utf-8').strip()
+            if line.startswith('event:'):
+                event_type = line.split(':', 1)[1].strip()
+            elif line.startswith('data:'):
+                data = line.split(':', 1)[1].strip()
+                if event_type == 'endpoint':
+                    message_endpoint = data
+                    if 'session_id=' in message_endpoint:
+                        session_id = message_endpoint.split('session_id=')[1].split('&')[0]
+                    break
+        
+        if not message_endpoint or not session_id:
+            conn.close()
+            return None
+        
+        return {
+            'session_id': session_id,
+            'message_endpoint': message_endpoint,
+            'connection': conn,
+            'response': response,
+            'server_url': server_url,
+            'auth_header': auth_header,
+            'reverse_queue': queue.Queue(),
+            'pending_responses': {},
+            'pending_responses_lock': threading.Lock(),
+            'stop_event': threading.Event(),
+        }
+    except Exception as e:
+        print(f"SSE connection error: {e}")
+        return None
+
+
+def send_jsonrpc_request(sse_connection, method, params, timeout_seconds=10.0):
+    """Send a JSON-RPC request via POST and wait for response via SSE."""
+    try:
+        request_id = str(uuid.uuid4())
+        response_queue = queue.Queue()
+        
+        with sse_connection['pending_responses_lock']:
+            sse_connection['pending_responses'][request_id] = response_queue
+        
+        try:
+            jsonrpc_request = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params
+            }
+            
+            request_body = json.dumps(jsonrpc_request)
+            parsed_url = urlparse(sse_connection['server_url'])
+            host = parsed_url.netloc
+            use_https = parsed_url.scheme == 'https'
+            
+            if use_https:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                post_conn = http.client.HTTPSConnection(host, context=context, timeout=10)
+            else:
+                post_conn = http.client.HTTPConnection(host, timeout=10)
+            
+            headers = {
+                'Content-Type': 'application/json',
+                'Content-Length': str(len(request_body)),
+                'Authorization': sse_connection['auth_header'],
+            }
+            
+            message_path = sse_connection['message_endpoint']
+            post_conn.request('POST', message_path, body=request_body, headers=headers)
+            post_response = post_conn.getresponse()
+            
+            if post_response.status != 202:
+                post_conn.close()
+                return None
+            
+            post_conn.close()
+            
+            try:
+                response = response_queue.get(timeout=timeout_seconds)
+                return response
+            except queue.Empty:
+                return None
+        finally:
+            with sse_connection['pending_responses_lock']:
+                sse_connection['pending_responses'].pop(request_id, None)
+    except Exception as e:
+        print(f"JSON-RPC request error: {e}")
+        return None
+
+
+def send_tool_reply(sse_connection, call_id, result):
+    """Send a tools/reply back to the server."""
+    try:
+        reply_request = {
+            "jsonrpc": "2.0",
+            "id": call_id,
+            "method": "tools/reply",
+            "params": {"result": result}
+        }
+        
+        request_body = json.dumps(reply_request)
+        parsed_url = urlparse(sse_connection['server_url'])
+        host = parsed_url.netloc
+        use_https = parsed_url.scheme == 'https'
+        
+        if use_https:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            post_conn = http.client.HTTPSConnection(host, context=context, timeout=10)
+        else:
+            post_conn = http.client.HTTPConnection(host, timeout=10)
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Content-Length': str(len(request_body)),
+            'Authorization': sse_connection['auth_header'],
+        }
+        
+        message_path = sse_connection['message_endpoint']
+        post_conn.request('POST', message_path, body=request_body, headers=headers)
+        post_response = post_conn.getresponse()
+        
+        success = post_response.status == 202
+        post_conn.close()
+        return success
+    except Exception as e:
+        print(f"Tool reply error: {e}")
+        return False
+
+
+# ============================================================================
+# BlenderMCP Server Class (with Reverse MCP support)
+# ============================================================================
+
 class BlenderMCPServer:
     def __init__(self, host='localhost', port=9876):
         self.host = host
@@ -39,6 +322,12 @@ class BlenderMCPServer:
         self.running = False
         self.socket = None
         self.server_thread = None
+        
+        # Reverse MCP attributes
+        self.mode = None  # Will be "reverse_mcp" or "legacy"
+        self.sse_connection = None
+        self.sse_reader_thread = None
+        self.reverse_listener_thread = None
 
     def start(self):
         if self.running:
@@ -46,7 +335,23 @@ class BlenderMCPServer:
             return
 
         self.running = True
-
+        
+        # Try Reverse MCP first
+        print("="*60)
+        print("BlenderMCP starting...")
+        print("="*60)
+        
+        if self._try_start_reverse_mcp():
+            print("✓ Started in Reverse MCP mode (direct MCP-Link integration)")
+            print("  No legacy server.py needed!")
+            print("="*60)
+            self.mode = "reverse_mcp"
+            return
+        
+        # Fallback to legacy socket mode
+        print("Reverse MCP not available, starting legacy socket server...")
+        print("="*60)
+        
         try:
             # Create socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -59,13 +364,275 @@ class BlenderMCPServer:
             self.server_thread.daemon = True
             self.server_thread.start()
 
-            print(f"BlenderMCP server started on {self.host}:{self.port}")
+            self.mode = "legacy"
+            print(f"✓ BlenderMCP server started on {self.host}:{self.port} (legacy mode)")
+            print(f"  Waiting for connection from server.py...")
+            print("="*60)
         except Exception as e:
             print(f"Failed to start server: {str(e)}")
             self.stop()
 
+    def _try_start_reverse_mcp(self):
+        """Try to start in Reverse MCP mode. Returns True if successful."""
+        try:
+            # Step 1: Find manifest
+            manifest_path = find_native_messaging_manifest()
+            if not manifest_path:
+                print("  MCP-Link Server not found")
+                return False
+            
+            print(f"  Found MCP-Link manifest")
+            
+            # Step 2: Discover endpoint
+            config_json = discover_mcp_server_endpoint(manifest_path)
+            if not config_json:
+                print("  Could not discover MCP-Link endpoint")
+                return False
+            
+            # Step 3: Extract server URL and auth
+            mcp_servers = config_json.get('mcpServers', {})
+            if not mcp_servers:
+                return False
+            
+            first_server = next(iter(mcp_servers.values()), None)
+            if not first_server:
+                return False
+            
+            server_url = first_server.get('url')
+            auth_header = first_server.get('headers', {}).get('Authorization')
+            
+            if not server_url or not auth_header:
+                print("  Could not extract server URL or auth")
+                return False
+            
+            print(f"  Connecting to MCP-Link Server...")
+            
+            # Step 4: Connect to SSE
+            self.sse_connection = connect_to_sse_endpoint(server_url, auth_header)
+            if not self.sse_connection:
+                print("  Could not connect to SSE endpoint")
+                return False
+            
+            print(f"  Connected! Session: {self.sse_connection['session_id']}")
+            
+            # Step 5: Start SSE reader thread
+            self._start_sse_reader()
+            
+            # Step 6: Check for remote tool
+            print("  Checking for remote tool...")
+            tools_response = send_jsonrpc_request(self.sse_connection, "tools/list", {})
+            if not tools_response:
+                print("  Could not get tools list")
+                self._cleanup_reverse_mcp()
+                return False
+            
+            tools = tools_response.get('result', {}).get('tools', [])
+            has_remote = any(tool.get('name') == 'remote' for tool in tools)
+            
+            if not has_remote:
+                print("  Server does not have 'remote' tool")
+                self._cleanup_reverse_mcp()
+                return False
+            
+            print("  Remote tool found!")
+            
+            # Step 7: Register Blender tools
+            print("  Registering Blender tools...")
+            if not self._register_blender_tools():
+                print("  Failed to register tools")
+                self._cleanup_reverse_mcp()
+                return False
+            
+            print("  All tools registered!")
+            
+            # Step 8: Start reverse call listener
+            self.reverse_listener_thread = threading.Thread(target=self._reverse_call_listener, daemon=True)
+            self.reverse_listener_thread.start()
+            
+            return True
+            
+        except Exception as e:
+            print(f"  Reverse MCP error: {e}")
+            traceback.print_exc()
+            self._cleanup_reverse_mcp()
+            return False
+    
+    def _start_sse_reader(self):
+        """Start the SSE reader thread."""
+        def sse_reader():
+            try:
+                response = self.sse_connection['response']
+                while self.running and not self.sse_connection['stop_event'].is_set():
+                    line = response.readline()
+                    if not line:
+                        break
+                    
+                    line_str = line.decode('utf-8', errors='ignore').strip()
+                    if line_str.startswith(':'):
+                        continue
+                    
+                    if line_str.startswith('data:'):
+                        data_str = line_str.split(':', 1)[1].strip()
+                        try:
+                            json_data = json.loads(data_str)
+                            if 'reverse' in json_data:
+                                self.sse_connection['reverse_queue'].put(json_data)
+                            elif 'id' in json_data:
+                                request_id = json_data['id']
+                                with self.sse_connection['pending_responses_lock']:
+                                    if request_id in self.sse_connection['pending_responses']:
+                                        self.sse_connection['pending_responses'][request_id].put(json_data)
+                        except json.JSONDecodeError:
+                            pass
+            except Exception as e:
+                if self.running:
+                    print(f"SSE reader error: {e}")
+        
+        self.sse_reader_thread = threading.Thread(target=sse_reader, daemon=True)
+        self.sse_reader_thread.start()
+    
+    def _register_blender_tools(self):
+        """Register all Blender tools with MCP-Link Server."""
+        tools = [
+            {
+                "tool_name": "blender_get_scene_info",
+                "readme": "Get detailed information about the current Blender scene.",
+                "description": "Retrieves comprehensive information about the current Blender scene including object count, names, types, locations, and materials.",
+                "parameters": {"type": "object", "properties": {}, "required": []}
+            },
+            {
+                "tool_name": "blender_get_object_info",
+                "readme": "Get detailed information about a specific object.",
+                "description": "Retrieves detailed information about a specific object in the Blender scene.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"object_name": {"type": "string", "description": "The name of the object"}},
+                    "required": ["object_name"]
+                }
+            },
+            {
+                "tool_name": "blender_execute_code",
+                "readme": "Execute Python code in Blender.",
+                "description": "Executes arbitrary Python code in Blender's context with access to bpy module.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"code": {"type": "string", "description": "The Python code to execute"}},
+                    "required": ["code"]
+                }
+            },
+        ]
+        
+        for tool_spec in tools:
+            registration_params = {
+                "name": "remote",
+                "arguments": {
+                    "input": {
+                        "operation": "register",
+                        "tool_name": tool_spec['tool_name'],
+                        "readme": tool_spec['readme'],
+                        "description": tool_spec['description'],
+                        "parameters": tool_spec['parameters'],
+                        "callback_endpoint": f"blender-mcp://{tool_spec['tool_name']}",
+                        "TOOL_API_KEY": "blender_mcp_auth_key_v1"
+                    }
+                }
+            }
+            
+            response = send_jsonrpc_request(self.sse_connection, "tools/call", registration_params)
+            if not response or 'result' not in response:
+                print(f"  Failed to register: {tool_spec['tool_name']}")
+                return False
+            
+            print(f"    ✓ {tool_spec['tool_name']}")
+        
+        return True
+    
+    def _reverse_call_listener(self):
+        """Listen for reverse tool calls from MCP-Link Server."""
+        print("  Reverse call listener started")
+        
+        while self.running:
+            try:
+                msg = self.sse_connection['reverse_queue'].get(timeout=1.0)
+                
+                if isinstance(msg, dict) and 'reverse' in msg:
+                    reverse_data = msg['reverse']
+                    tool_name = reverse_data.get('tool')
+                    call_id = reverse_data.get('call_id')
+                    input_data = reverse_data.get('input')
+                    
+                    print(f"[Reverse Call] {tool_name}")
+                    
+                    # Handle the call
+                    result = self._handle_reverse_tool_call(tool_name, input_data)
+                    
+                    # Send reply
+                    send_tool_reply(self.sse_connection, call_id, result)
+            
+            except queue.Empty:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Reverse listener error: {e}")
+    
+    def _handle_reverse_tool_call(self, tool_name, input_data):
+        """Handle a reverse tool call by executing in Blender."""
+        try:
+            arguments = input_data.get('params', {}).get('arguments', {})
+            
+            if tool_name == "blender_get_scene_info":
+                result = self.get_scene_info()
+                return {
+                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                    "isError": False
+                }
+            
+            elif tool_name == "blender_get_object_info":
+                object_name = arguments.get('object_name')
+                result = self.get_object_info(object_name)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                    "isError": False
+                }
+            
+            elif tool_name == "blender_execute_code":
+                code = arguments.get('code')
+                result = self.execute_code(code)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                    "isError": False
+                }
+            
+            else:
+                return {
+                    "content": [{"type": "text", "text": f"Unknown tool: {tool_name}"}],
+                    "isError": True
+                }
+        
+        except Exception as e:
+            return {
+                "content": [{"type": "text", "text": f"Error: {str(e)}"}],
+                "isError": True
+            }
+    
+    def _cleanup_reverse_mcp(self):
+        """Clean up Reverse MCP resources."""
+        if self.sse_connection:
+            try:
+                self.sse_connection['stop_event'].set()
+                if self.sse_reader_thread:
+                    self.sse_reader_thread.join(timeout=1)
+                self.sse_connection['connection'].close()
+            except:
+                pass
+            self.sse_connection = None
+
     def stop(self):
         self.running = False
+        
+        # Clean up Reverse MCP if active
+        if self.mode == "reverse_mcp":
+            self._cleanup_reverse_mcp()
 
         # Close socket
         if self.socket:

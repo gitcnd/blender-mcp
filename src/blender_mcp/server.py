@@ -22,18 +22,6 @@ logger = logging.getLogger("BlenderMCPServer")
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
 
-# Try to import Reverse MCP bridge
-try:
-  from .reverse_bridge import ReverseBlenderConnection
-  REVERSE_MCP_AVAILABLE = True
-  logger.info("Reverse MCP bridge is available")
-except ImportError as e:
-  REVERSE_MCP_AVAILABLE = False
-  logger.info(f"Reverse MCP bridge not available: {e}")
-
-# Global flag to track which connection mode we're using
-USE_REVERSE_MCP = False
-
 @dataclass
 class BlenderConnection:
     host: str
@@ -184,27 +172,12 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
     
     try:
         # Just log that we're starting up
-        logger.info("="*60)
         logger.info("BlenderMCP server starting up")
-        logger.info("="*60)
         
         # Try to connect to Blender on startup to verify it's available
         try:
             # This will initialize the global connection if needed
             blender = get_blender_connection()
-            
-            if USE_REVERSE_MCP:
-                logger.info("="*60)
-                logger.info("✓ CONNECTION MODE: Reverse MCP (Advanced)")
-                logger.info("  Connected via Aura Friday MCP-Link Server")
-                logger.info("  Tools are registered and accessible via MCP-Link")
-                logger.info("="*60)
-            else:
-                logger.info("="*60)
-                logger.info("CONNECTION MODE: Legacy STDIO")
-                logger.info("  Direct socket connection to Blender")
-                logger.info("="*60)
-            
             logger.info("Successfully connected to Blender on startup")
         except Exception as e:
             logger.warning(f"Could not connect to Blender on startup: {str(e)}")
@@ -234,8 +207,8 @@ _blender_connection = None
 _polyhaven_enabled = False  # Add this global variable
 
 def get_blender_connection():
-    """Get or create a persistent Blender connection (with Reverse MCP support)"""
-    global _blender_connection, _polyhaven_enabled, USE_REVERSE_MCP
+    """Get or create a persistent Blender connection"""
+    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
     
     # If we have an existing connection, check if it's still valid
     if _blender_connection is not None:
@@ -258,33 +231,12 @@ def get_blender_connection():
     if _blender_connection is None:
         host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
         port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
-        
-        # Try Reverse MCP first if available
-        if REVERSE_MCP_AVAILABLE and not USE_REVERSE_MCP:
-            logger.info("Attempting to connect via Reverse MCP (Aura Friday MCP-Link Server)...")
-            try:
-                reverse_conn = ReverseBlenderConnection(host=host, port=port)
-                if reverse_conn.connect():
-                    logger.info("✓ Successfully connected via Reverse MCP!")
-                    logger.info("  Using advanced MCP-Link Server communication")
-                    _blender_connection = reverse_conn
-                    USE_REVERSE_MCP = True
-                    return _blender_connection
-                else:
-                    logger.info("  Reverse MCP connection failed, falling back to legacy mode")
-            except Exception as e:
-                logger.info(f"  Reverse MCP error: {e}")
-                logger.info("  Falling back to legacy STDIO mode")
-        
-        # Fall back to legacy direct socket connection
-        if not USE_REVERSE_MCP:
-            logger.info("Using legacy direct socket connection to Blender")
-            _blender_connection = BlenderConnection(host=host, port=port)
-            if not _blender_connection.connect():
-                logger.error("Failed to connect to Blender")
-                _blender_connection = None
-                raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
-            logger.info("Created new persistent connection to Blender (legacy mode)")
+        _blender_connection = BlenderConnection(host=host, port=port)
+        if not _blender_connection.connect():
+            logger.error("Failed to connect to Blender")
+            _blender_connection = None
+            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
+        logger.info("Created new persistent connection to Blender")
     
     return _blender_connection
 

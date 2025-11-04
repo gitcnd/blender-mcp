@@ -45,13 +45,21 @@ Give feedback, get inspired, and build on top of the MCP: [Discord](https://disc
 
 ### 🆕 Reverse MCP Mode (Optional Enhancement)
 
-This fork includes support for the **Aura Friday MCP-Link Server**, which provides:
-- Enhanced tool registration and discovery
-- Better error handling and retry logic
-- Support for multiple AI clients simultaneously
-- Future-proof architecture for advanced MCP features
+This fork includes **direct integration** with the **Aura Friday MCP-Link Server**:
 
-The system automatically detects and uses the MCP-Link Server if available, otherwise falls back to the standard STDIO mode. See [REVERSE_MCP_INTEGRATION.md](REVERSE_MCP_INTEGRATION.md) for details.
+**When MCP-Link Server is installed:**
+- ✅ Blender addon connects directly to MCP-Link Server
+- ✅ No intermediate server.py process needed
+- ✅ No TCP socket on port 9876 required
+- ✅ More efficient direct communication
+- ✅ Support for multiple AI clients simultaneously
+
+**When MCP-Link Server is NOT installed:**
+- Falls back to standard STDIO mode automatically
+- Works exactly as the original BlenderMCP
+- No configuration needed
+
+The Blender addon automatically detects and chooses the best mode on startup. See [ARCHITECTURE.md](ARCHITECTURE.md) for technical details.
 
 ## Components
 
